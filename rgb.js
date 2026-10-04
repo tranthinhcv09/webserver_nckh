@@ -18,10 +18,10 @@ function readStoredArray(key) {
   }
 }
 
-const DEVICE_DATABASE_NAME = "smart-home-dashboard";
-const DEVICE_DATABASE_VERSION = 1;
-const DEVICE_STORE_NAME = "app-data";
-const DEVICE_RECORD_KEY = "devices";
+const LEGACY_DEVICE_DATABASE_NAME = "smart-home-dashboard";
+const LEGACY_DEVICE_STORE_NAME = "app-data";
+const LEGACY_DEVICE_RECORD_KEY = "devices";
+const LEGACY_ACCOUNT_MIGRATION_KEY = "smartHomeInitialAccountClaimed";
 
 const LEGACY_DEFAULT_ROOM_IDS = new Set([
   "living-room",
@@ -36,6 +36,16 @@ const LEGACY_DEFAULT_DEVICE_IDS = new Set([
   "device_dht_sensor",
   "device_curtain_main",
 ]);
+
+function removeLegacyDefaults(rooms, devices) {
+  return {
+    rooms: rooms.filter((room) => !LEGACY_DEFAULT_ROOM_IDS.has(room.id)),
+    devices: devices.filter(
+      (device) =>
+        !device.isBuiltin && !LEGACY_DEFAULT_DEVICE_IDS.has(device.id),
+    ),
+  };
+}
 
 function removeLegacyDefaults(rooms, devices) {
   return {
@@ -69,119 +79,8 @@ function normalizeDevices(devices) {
   return devices;
 }
 
-let deviceDatabasePromise;
-
-function openDeviceDatabase() {
-  if (deviceDatabasePromise) return deviceDatabasePromise;
-
-  deviceDatabasePromise = new Promise((resolve, reject) => {
-    if (!window.indexedDB) {
-      reject(new Error("Trình duyệt không hỗ trợ IndexedDB."));
-      return;
-    }
-
-    const request = window.indexedDB.open(
-      DEVICE_DATABASE_NAME,
-      DEVICE_DATABASE_VERSION,
-    );
-    request.onupgradeneeded = () => {
-      request.result.createObjectStore(DEVICE_STORE_NAME, { keyPath: "key" });
-    };
-    request.onsuccess = () => {
-      const database = request.result;
-      database.onversionchange = () => {
-        database.close();
-        deviceDatabasePromise = null;
-      };
-      resolve(database);
-    };
-    request.onerror = () => {
-      deviceDatabasePromise = null;
-      reject(request.error || new Error("Không thể mở IndexedDB."));
-    };
-    request.onblocked = () => {
-      deviceDatabasePromise = null;
-      reject(new Error("IndexedDB đang bị chặn bởi một kết nối khác."));
-    };
-  });
-
-  return deviceDatabasePromise;
-}
-
-async function readDevicesFromDatabase() {
-  const database = await openDeviceDatabase();
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(DEVICE_STORE_NAME, "readonly");
-    const request = transaction
-      .objectStore(DEVICE_STORE_NAME)
-      .get(DEVICE_RECORD_KEY);
-    request.onsuccess = () => resolve(request.result?.devices ?? null);
-    request.onerror = () =>
-      reject(request.error || new Error("Không thể đọc danh sách thiết bị."));
-    transaction.onabort = () =>
-      reject(
-        transaction.error || new Error("Không thể đọc danh sách thiết bị."),
-      );
-  });
-}
-
-async function writeDevicesToDatabase(devices) {
-  const database = await openDeviceDatabase();
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(DEVICE_STORE_NAME, "readwrite");
-    transaction.objectStore(DEVICE_STORE_NAME).put({
-      key: DEVICE_RECORD_KEY,
-      devices,
-    });
-    transaction.oncomplete = resolve;
-    transaction.onerror = () =>
-      reject(
-        transaction.error || new Error("Không thể lưu danh sách thiết bị."),
-      );
-    transaction.onabort = () =>
-      reject(
-        transaction.error || new Error("Không thể lưu danh sách thiết bị."),
-      );
-  });
-}
-
-async function loadDevices() {
-  let devices = await readDevicesFromDatabase();
-  if (devices === null) {
-    const legacyValue = localStorage.getItem("smarthome_devices");
-    let canRemoveLegacyValue = !legacyValue;
-    if (legacyValue) {
-      try {
-        const legacyDevices = JSON.parse(legacyValue);
-        if (Array.isArray(legacyDevices)) {
-          devices = removeLegacyDefaults([], legacyDevices).devices;
-          canRemoveLegacyValue = true;
-        } else {
-          console.warn("Dữ liệu thiết bị cũ không phải một danh sách.");
-          devices = [];
-        }
-      } catch (error) {
-        console.warn("Không thể đọc dữ liệu thiết bị cũ:", error);
-        devices = [];
-      }
-    } else {
-      devices = [];
-    }
-
-    await writeDevicesToDatabase(normalizeDevices(devices));
-    if (canRemoveLegacyValue) {
-      localStorage.removeItem("smarthome_devices");
-    }
-  }
-
-  if (!Array.isArray(devices)) {
-    throw new Error("Dữ liệu thiết bị trong IndexedDB không hợp lệ.");
-  }
-  return normalizeDevices(devices);
-}
-
 let state = {
-  rooms: readStoredArray("smarthome_rooms"),
+  rooms: [],
   devices: [],
   activeRoom: "all",
   searchQuery: "",
@@ -191,20 +90,135 @@ let state = {
   editingDeviceId: null,
 };
 
-state.rooms = removeLegacyDefaults(state.rooms, []).rooms;
+let currentUser = null;
+let persistenceQueue = Promise.resolve();
+let persistenceError = null;
+
+async function apiRequest(path, options = {}) {
+  const response = await fetch(path, {
+    credentials: "same-origin",
+    ...options,
+    headers: {
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...options.headers,
+    },
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result.error || `Yêu cầu thất bại (${response.status}).`);
+  }
+  return result;
+}
+
+async function readLegacyDevicesFromIndexedDB() {
+  if (!window.indexedDB) return [];
+
+  const database = await new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(LEGACY_DEVICE_DATABASE_NAME, 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(LEGACY_DEVICE_STORE_NAME, {
+        keyPath: "key",
+      });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () =>
+      reject(request.error || new Error("Không thể mở dữ liệu thiết bị cũ."));
+  });
+
+  return new Promise((resolve, reject) => {
+    const request = database
+      .transaction(LEGACY_DEVICE_STORE_NAME, "readonly")
+      .objectStore(LEGACY_DEVICE_STORE_NAME)
+      .get(LEGACY_DEVICE_RECORD_KEY);
+    request.onsuccess = () => {
+      database.close();
+      resolve(Array.isArray(request.result?.devices) ? request.result.devices : []);
+    };
+    request.onerror = () => {
+      database.close();
+      reject(request.error || new Error("Không thể đọc dữ liệu thiết bị cũ."));
+    };
+  });
+}
+
+async function loadLegacyAccountState() {
+  const rooms = readStoredArray("smarthome_rooms");
+  let devices = [];
+  const legacyValue = localStorage.getItem("smarthome_devices");
+  if (legacyValue) {
+    try {
+      const parsedDevices = JSON.parse(legacyValue);
+      if (Array.isArray(parsedDevices)) devices = parsedDevices;
+    } catch (error) {
+      console.warn("Không thể đọc danh sách thiết bị cũ:", error);
+    }
+  }
+  if (devices.length === 0) {
+    devices = await readLegacyDevicesFromIndexedDB();
+  }
+  const legacyState = removeLegacyDefaults(rooms, devices);
+  return {
+    rooms: legacyState.rooms,
+    devices: normalizeDevices(legacyState.devices),
+  };
+}
+
+async function clearLegacyAccountState() {
+  localStorage.removeItem("smarthome_rooms");
+  localStorage.removeItem("smarthome_devices");
+  localStorage.setItem(LEGACY_ACCOUNT_MIGRATION_KEY, "true");
+  if (!window.indexedDB) return;
+
+  const database = await new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(LEGACY_DEVICE_DATABASE_NAME, 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(LEGACY_DEVICE_STORE_NAME, {
+        keyPath: "key",
+      });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () =>
+      reject(request.error || new Error("Không thể mở dữ liệu thiết bị cũ."));
+  });
+  await new Promise((resolve, reject) => {
+    const transaction = database.transaction(
+      LEGACY_DEVICE_STORE_NAME,
+      "readwrite",
+    );
+    transaction.objectStore(LEGACY_DEVICE_STORE_NAME).delete(
+      LEGACY_DEVICE_RECORD_KEY,
+    );
+    transaction.oncomplete = resolve;
+    transaction.onerror = () =>
+      reject(transaction.error || new Error("Không thể xóa dữ liệu thiết bị cũ."));
+    transaction.onabort = () =>
+      reject(transaction.error || new Error("Không thể xóa dữ liệu thiết bị cũ."));
+  });
+  database.close();
+}
 
 function saveState() {
-  try {
-    localStorage.setItem("smarthome_rooms", JSON.stringify(state.rooms));
-  } catch (error) {
-    console.error("Không thể lưu dữ liệu phòng:", error);
-    showToast("Không thể lưu danh sách phòng trên trình duyệt này!", "error");
-  }
-
-  return writeDevicesToDatabase(state.devices).catch((error) => {
-    console.error("Không thể lưu thiết bị vào IndexedDB:", error);
-    showToast("Không thể lưu thiết bị vào cơ sở dữ liệu!", "error");
+  if (!currentUser) return Promise.resolve();
+  const owner = currentUser.username;
+  const payload = JSON.stringify({
+    rooms: state.rooms,
+    devices: state.devices,
   });
+  persistenceQueue = persistenceQueue
+    .catch(() => {})
+    .then(() => {
+      if (!currentUser || currentUser.username !== owner) return;
+      return apiRequest("/api/state", { method: "PUT", body: payload });
+    })
+    .then(() => {
+      persistenceError = null;
+    })
+    .catch((error) => {
+      persistenceError = error;
+      console.error("Không thể lưu dữ liệu tài khoản:", error);
+      showToast("Không thể đồng bộ thiết bị với máy chủ!", "error");
+    });
+  return persistenceQueue;
 }
 
 // ==========================================
@@ -1654,27 +1668,156 @@ function updateClock() {
   }
 }
 
-// ==========================================
-// 12. INITIALIZATION & EVENT LISTENERS
-// ==========================================
+let authMode = "login";
+let clockTimer = null;
 
-window.addEventListener("DOMContentLoaded", async () => {
-  try {
-    state.devices = await loadDevices();
-    await saveState();
-  } catch (error) {
-    console.error("Không thể khởi tạo cơ sở dữ liệu thiết bị:", error);
-    showToast("Không thể tải thiết bị từ cơ sở dữ liệu!", "error");
+function setAuthError(message = "") {
+  const errorElement = document.getElementById("authError");
+  if (!errorElement) return;
+  errorElement.textContent = message;
+  errorElement.hidden = !message;
+}
+
+function updateAuthMode() {
+  const registering = authMode === "register";
+  document.getElementById("authTitle").textContent = registering
+    ? "Tạo tài khoản"
+    : "Đăng nhập";
+  document.getElementById("authSubmit").textContent = registering
+    ? "Đăng ký"
+    : "Đăng nhập";
+  document.getElementById("authSwitchPrompt").textContent = registering
+    ? "Đã có tài khoản?"
+    : "Chưa có tài khoản?";
+  document.getElementById("authModeToggle").textContent = registering
+    ? "Đăng nhập"
+    : "Đăng ký";
+  document.getElementById("authPassword").autocomplete = registering
+    ? "new-password"
+    : "current-password";
+  setAuthError();
+}
+
+async function enterDashboard(user) {
+  persistenceQueue = Promise.resolve();
+  persistenceError = null;
+  let accountData = await apiRequest("/api/state");
+  currentUser = user;
+
+  if (!accountData.initialized) {
+    const shouldImportLegacy =
+      localStorage.getItem(LEGACY_ACCOUNT_MIGRATION_KEY) !== "true";
+    const initialData = shouldImportLegacy
+      ? await loadLegacyAccountState()
+      : { rooms: [], devices: [] };
+    await apiRequest("/api/state", {
+      method: "PUT",
+      body: JSON.stringify(initialData),
+    });
+    if (shouldImportLegacy) await clearLegacyAccountState();
+    accountData = { ...initialData, initialized: true };
   }
 
-  // Set theme
+  if (!Array.isArray(accountData.rooms) || !Array.isArray(accountData.devices)) {
+    currentUser = null;
+    throw new Error("Dữ liệu tài khoản trên máy chủ không hợp lệ.");
+  }
+
+  state.rooms = accountData.rooms;
+  state.devices = normalizeDevices(accountData.devices);
+  document.getElementById("accountLabel").textContent =
+    `Đang đăng nhập: ${user.username}`;
+  document.getElementById("authView").hidden = true;
+  document.getElementById("appContainer").hidden = false;
+
   document.documentElement.setAttribute("data-theme", state.theme);
   const themeIcon = document.getElementById("themeIcon");
   if (themeIcon) themeIcon.textContent = state.theme === "dark" ? "🌙" : "☀️";
 
-  // Broker input value
   const brokerInput = document.getElementById("brokerUrlInput");
   if (brokerInput) brokerInput.value = state.brokerUrl;
+
+  renderRooms();
+  updateRoomSelectOptions();
+  renderDevices();
+  updateClock();
+  if (!clockTimer) clockTimer = setInterval(updateClock, 1000);
+  initMQTT();
+}
+
+async function handleAuthSubmit(event) {
+  event.preventDefault();
+  const username = document.getElementById("authUsername").value.trim();
+  const password = document.getElementById("authPassword").value;
+  const submitButton = document.getElementById("authSubmit");
+  submitButton.disabled = true;
+  setAuthError();
+
+  try {
+    const result = await apiRequest(
+      authMode === "register" ? "/api/register" : "/api/login",
+      {
+        method: "POST",
+        body: JSON.stringify({ username, password }),
+      },
+    );
+    await enterDashboard(result.user);
+  } catch (error) {
+    currentUser = null;
+    setAuthError(error.message || "Không thể đăng nhập.");
+  } finally {
+    submitButton.disabled = false;
+  }
+}
+
+async function handleLogout() {
+  try {
+    await saveState();
+    if (persistenceError) throw persistenceError;
+    await apiRequest("/api/logout", { method: "POST", body: "{}" });
+    disconnectBroker(false);
+    currentUser = null;
+    state.rooms = [];
+    state.devices = [];
+    document.getElementById("appContainer").hidden = true;
+    document.getElementById("authView").hidden = false;
+    document.getElementById("authForm").reset();
+    setAuthError();
+  } catch (error) {
+    console.error("Không thể đăng xuất:", error);
+    showToast("Không thể đăng xuất. Kiểm tra kết nối máy chủ.", "error");
+  }
+}
+
+// ==========================================
+// 12. INITIALIZATION & EVENT LISTENERS
+// ==========================================
+
+window.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("authForm").addEventListener("submit", handleAuthSubmit);
+  document.getElementById("authModeToggle").addEventListener("click", () => {
+    authMode = authMode === "login" ? "register" : "login";
+    updateAuthMode();
+  });
+  document
+    .getElementById("logoutButton")
+    .addEventListener("click", handleLogout);
+
+  try {
+    apiRequest("/api/me")
+      .then(({ user }) => enterDashboard(user))
+      .catch((error) => {
+        currentUser = null;
+        document.getElementById("authView").hidden = false;
+        document.getElementById("appContainer").hidden = true;
+        if (error.message !== "Vui lòng đăng nhập để tiếp tục.") {
+          setAuthError(`Không kết nối được máy chủ: ${error.message}`);
+        }
+      });
+  } catch (error) {
+    console.error("Không thể khởi tạo giao diện đăng nhập:", error);
+    setAuthError("Không thể khởi tạo giao diện đăng nhập.");
+  }
 
   // Search input listener
   const searchInput = document.getElementById("deviceSearchInput");
@@ -1691,15 +1834,4 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
   });
 
-  // Render Dashboard
-  renderRooms();
-  updateRoomSelectOptions();
-  renderDevices();
-
-  // Clock Timer
-  updateClock();
-  setInterval(updateClock, 1000);
-
-  // Connect MQTT Engine
-  initMQTT();
 });
